@@ -1,0 +1,270 @@
+package simplego
+
+import (
+	"github.com/gomlx/gomlx/pkg/core/dtypes"
+	"github.com/gomlx/gomlx/pkg/core/shapes"
+)
+
+// isMatMulOrder checks if the DotGeneral operands are in standard matrix multiplication order:
+// LHS: [Batch..., M, K] (contracting dimension last)
+// RHS: [Batch..., K, N] (contracting dimension first after batch)
+//
+// This is the familiar [M, K] × [K, N] → [M, N] layout.
+//
+// Memory access pattern analysis for row-major storage:
+//
+//	For [M, K] × [K, N] → [M, N]:
+//	- LHS row m: elements at [m*K, m*K+1, ..., m*K+K-1] → SEQUENTIAL (good cache locality)
+//	- RHS col n: elements at [n, N+n, 2N+n, ...] → STRIDED with stride N (poor cache locality)
+//
+// This function returns true when inputs are already in this standard order, meaning we can
+// skip the transpose/normalization step. However, note that for LARGE matrices, the strided
+// RHS access causes cache thrashing, so the normalized path (which transposes RHS to make
+// both operands have sequential access) may be faster despite the transpose overhead.
+//
+// Supported patterns (generalized for any number of batch dimensions):
+//   - Matrix × Matrix: [M, K] × [K, N] → [M, N]
+//   - Matrix × Vector: [M, K] × [K] → [M]
+//   - Batched: [B..., M, K] × [B..., K, N] → [B..., M, N]
+//
+// Requirements:
+//   - Single contracting axis only
+//   - Batch axes must be leading and sequential (0, 1, 2, ...)
+//   - LHS contracting axis must be last
+//   - RHS contracting axis must be first after batch axes
+//
+// See also: execDotGeneralSmallNormalized which transposes to [Batch, Cross, Contract] form
+// where BOTH operands have the contracting dimension last (sequential access for both).
+func isMatMulOrder(lhsShape shapes.Shape, lhsContractingAxes, lhsBatchAxes []int,
+	rhsShape shapes.Shape, rhsContractingAxes, rhsBatchAxes []int) bool {
+	lhs, rhs := needsTransposeForMatMul(lhsShape, lhsContractingAxes, lhsBatchAxes,
+		rhsShape, rhsContractingAxes, rhsBatchAxes)
+	return lhs == noTranspose && rhs == noTranspose
+}
+
+// canUseHighwayPath checks if highway can handle the DotGeneral operation.
+// Highway can handle:
+// 1. Already in matmul order (no transpose needed)
+// 2. Cases where a simple 2D transpose of the last two dimensions fixes the order
+//
+// This includes:
+//   - LHS: [Batch..., K, M] → transpose to [Batch..., M, K]
+//   - RHS: [Batch..., N, K] → transpose to [Batch..., K, N]
+func canUseHighwayPath(lhsShape shapes.Shape, lhsContractingAxes, lhsBatchAxes []int,
+	rhsShape shapes.Shape, rhsContractingAxes, rhsBatchAxes []int) bool {
+	lhsNeedsTranspose, rhsNeedsTranspose := needsTransposeForMatMul(lhsShape, lhsContractingAxes, lhsBatchAxes,
+		rhsShape, rhsContractingAxes, rhsBatchAxes)
+	// If either returns invalid (-1), we can't use highway
+	return lhsNeedsTranspose != invalidTranspose && rhsNeedsTranspose != invalidTranspose
+}
+
+// transposeNeeded indicates whether transpose is needed and if it's valid.
+type transposeNeeded int
+
+const (
+	noTranspose      transposeNeeded = iota // Already in correct order
+	needs2DTranspose                        // Needs 2D transpose of last two dims
+	invalidTranspose                        // Cannot be fixed with simple transpose
+)
+
+// needsTransposeForMatMul checks if LHS and RHS need transposing to be in matmul order.
+// Returns the transpose requirement for each operand.
+//
+// For matmul order we need:
+//   - LHS: [Batch..., Cross..., K] (contracting axis last)
+//   - RHS: [Batch..., K, N] or [Batch..., N, K] (K-last uses MatMulKLast)
+//
+// Supports multi-cross-dimension patterns like "bsi,oi->bso" where LHS has multiple
+// cross dimensions (batch, seq). The cross dimensions get flattened by the caller
+// into a single M dimension for the matmul.
+//
+// Highway can handle:
+//   - LHS with K last (any number of cross dims) → noTranspose
+//   - LHS with K second-to-last (2D only) → needs2DTranspose
+//   - RHS with K first after batch → noTranspose (standard matmul)
+//   - RHS with K last → needs2DTranspose (uses MatMulKLast optimization)
+func needsTransposeForMatMul(lhsShape shapes.Shape, lhsContractingAxes, lhsBatchAxes []int,
+	rhsShape shapes.Shape, rhsContractingAxes, rhsBatchAxes []int) (lhsTranspose, rhsTranspose transposeNeeded) {
+	lhsRank := lhsShape.Rank()
+	rhsRank := rhsShape.Rank()
+
+	// Only support single contracting axis
+	if len(lhsContractingAxes) != 1 || len(rhsContractingAxes) != 1 {
+		return invalidTranspose, invalidTranspose
+	}
+
+	// Batch axes must match in count and must precede other dimensions.
+	numBatchAxes := len(lhsBatchAxes)
+	if len(rhsBatchAxes) != numBatchAxes {
+		return invalidTranspose, invalidTranspose
+	}
+	for i := range numBatchAxes {
+		if lhsBatchAxes[i] != i || rhsBatchAxes[i] != i {
+			return invalidTranspose, invalidTranspose
+		}
+	}
+
+	// Both LHS and RHS must have at least 2 non-batch dimensions for matmul.
+	// This excludes vector cases like [M, K] x [K] which can't be handled by highway matmul.
+	if lhsRank < numBatchAxes+2 || rhsRank < numBatchAxes+2 {
+		return invalidTranspose, invalidTranspose
+	}
+
+	// Check LHS: contracting axis should be last for matmul order.
+	// Supports multi-cross-dimension cases like [Batch, Seq, Features] when K is last.
+	lhsContractingAxis := lhsContractingAxes[0]
+	if lhsContractingAxis == lhsRank-1 {
+		// K is last, no transpose needed (works for any number of cross dims)
+		// e.g., [B, M, K] or [B, S, M, K] - cross dims get flattened by caller
+		lhsTranspose = noTranspose
+	} else if lhsRank == numBatchAxes+2 && lhsContractingAxis == lhsRank-2 {
+		// Simple 2D case: [Batch..., K, M] → can transpose to [Batch..., M, K]
+		lhsTranspose = needs2DTranspose
+	} else {
+		// Multi-cross with K not last, or K in unexpected position - can't handle
+		return invalidTranspose, invalidTranspose
+	}
+
+	// Check RHS: contracting axis should be first after batch (standard) or last (K-last).
+	// K-last format is common for PyTorch weights: [out, in] where 'in' is the contracting dim.
+	rhsContractingAxis := rhsContractingAxes[0]
+	if rhsContractingAxis == numBatchAxes {
+		// Standard matmul order: [Batch..., K, N] - K is first after batch
+		rhsTranspose = noTranspose
+	} else if rhsContractingAxis == rhsRank-1 {
+		// K-last order: [Batch..., N, K] - can use MatMulKLast (or transpose if 2D)
+		// This works for both 2D case [N, K] and multi-cross [N1, N2, K]
+		rhsTranspose = needs2DTranspose
+	} else {
+		// K is not in first or last position - can't handle
+		return invalidTranspose, invalidTranspose
+	}
+
+	return lhsTranspose, rhsTranspose
+}
+
+// smallMatMulMaxContractingSize is the maximum contracting dimension size for which
+// the small matmul (no-transpose) path is beneficial. Beyond this size, the strided RHS
+// access pattern causes too many cache misses, and the normalized path (which
+// transposes RHS for sequential access) becomes faster despite the transpose overhead.
+//
+// This threshold was determined by benchmarking (BenchmarkSmallMatMulThreshold):
+//   - For [256, K] × [K, 256]: SmallMatMul wins at K≤128, NormalizedPath wins at K≥256
+//   - Crossover point is between K=128 and K=256
+//
+// Exception: For single-row operations (M=1), SmallMatMul is always faster because
+// the transpose overhead dominates when there's only one output row to compute.
+const smallMatMulMaxContractingSize = 128
+
+// smallMatMulMaxBatchSize is the maximum batch size for which the small matmul path is beneficial.
+// For larger batch sizes, the normalized path with batch parallelism is faster.
+// The small matmul path processes batches sequentially, while the normalized path can parallelize
+// across batches using multiple workers.
+const smallMatMulMaxBatchSize = 64
+
+// smallMatMulMaxRhsCrossSize is the maximum RHS cross dimension (N) for which
+// the small matmul path is beneficial. In [M, K] × [K, N] → [M, N], the RHS is
+// accessed with stride N during the contracting loop. When N is large, each
+// iteration causes a cache line miss, making the normalized path faster despite
+// the transpose overhead.
+//
+// This threshold is important because the RHS stride equals N, so large N causes
+// more cache misses per contracting step than large K does.
+const smallMatMulMaxRhsCrossSize = 64
+
+// smallMatMulMaxRhsCrossSizeM1 is the maximum RHS cross dimension (N) for M=1 cases.
+// For single-row operations, transpose overhead is more significant relative to
+// computation, so we use a higher threshold. However, we still need a cap to avoid
+// catastrophic cache behavior with very large N (e.g., [1, K] × [K, 100000]).
+// The strided access pattern with stride N=100000 would cause a cache miss on
+// virtually every RHS element access.
+const smallMatMulMaxRhsCrossSizeM1 = 4096
+
+// smallMatMulMaxContractingSizeM1 is the maximum contracting dimension (K) for M=1 cases.
+// For single-row operations, transpose overhead is more significant, so we use a higher
+// threshold than smallMatMulMaxContractingSize. However, very large K values (e.g., 10000)
+// still cause cache thrashing due to strided RHS access, so we cap it.
+const smallMatMulMaxContractingSizeM1 = 1024
+
+// smallMatMulMaxSize is the maximum size in bytes of the output for which the small matmul
+// path is beneficial. This is a sanity check to avoid using the small matmul path for
+// very large outputs -- which usually will do better with normalized/blocked paths
+const smallMatMulMaxSize = 256 * 1024 // 256Kb
+
+// dgUseSmallMatMul checks whether the SmallMatMul fast path is beneficial.
+// SmallMatMul skips transpose overhead but has strided RHS access, so it's only
+// beneficial for small matrices in standard [M,K]×[K,N] order.
+// Supports all numeric dtypes (POD types + BFloat16 + Float16).
+func dgUseSmallMatMul(dtype dtypes.DType, lhsShape, rhsShape shapes.Shape, params *dotGeneralNodeData) bool {
+	// Check if dtype has a registered SmallMatMul implementation
+	if dtype >= MaxDTypes || dotGeneralSmallMatMulDTypeMap.Map[dtype] == nil {
+		return false
+	}
+
+	// Check if axes are in standard matmul order
+	if !isMatMulOrder(lhsShape, params.lhsContractingAxes, params.lhsBatchAxes,
+		rhsShape, params.rhsContractingAxes, params.rhsBatchAxes) {
+		return false
+	}
+
+	// For large batch sizes, the normalized path with batch parallelism is faster.
+	// The small matmul path processes batches sequentially without parallelization.
+	if params.batchSize > smallMatMulMaxBatchSize {
+		return false
+	}
+
+	// For single-row operations (M=1), SmallMatMul is faster because transpose overhead
+	// dominates when computing just one output row per batch.
+	// BUT we still need to check rhsCrossSize and contractingSize - for M=1 with huge N or K,
+	// the strided access causes cache thrashing.
+	if params.lhsCrossSize == 1 {
+		// For M=1, use larger thresholds since transpose overhead is more significant
+		// But still cap to avoid catastrophic cache behavior with very large dimensions
+		if params.rhsCrossSize > smallMatMulMaxRhsCrossSizeM1 {
+			return false
+		}
+		if params.contractingSize > smallMatMulMaxContractingSizeM1 {
+			return false
+		}
+		return true
+	}
+
+	// For multi-row operations, check both contracting and RHS cross dimensions.
+	// The RHS is accessed with stride N (rhsCrossSize), so large N causes more cache
+	// misses per contracting step.
+	if params.contractingSize > smallMatMulMaxContractingSize {
+		return false
+	}
+
+	// Check RHS cross size (N) - large N means large stride in RHS access
+	if params.rhsCrossSize > smallMatMulMaxRhsCrossSize {
+		return false
+	}
+
+	// Larger data size benefit from the blocking done by the blocked and normalized paths.
+	problemSize := /* LHS size */ params.lhsCrossSize*params.contractingSize +
+		/* RHS size */ params.rhsCrossSize*params.contractingSize +
+		/* Output size */ params.lhsCrossSize*params.rhsCrossSize
+	problemSize *= params.batchSize
+	problemSize *= dtype.Size()
+	if problemSize > smallMatMulMaxSize {
+		return false
+	}
+	return true
+}
+
+// dotGeneralSmallMatMulDTypeMap holds the dtype-specific implementations for SmallMatMul.
+// Generic POD types are registered via simplego_dispatcher (gen_register_dtypes.go).
+// BFloat16/Float16 are registered here with specialized implementations that output to float32.
+var dotGeneralSmallMatMulDTypeMap = NewDTypeMap("DotGeneralSmallMatMul")
+
+// Auto-generate alternate specialized versions of execDotGeneralSmallMatMul for BFloat16/Float16
+// (these need float32 accumulation for numerical stability)
+//go:generate go run ../internal/cmd/alternates_generator -base=dotgeneral_small_matmul_alt_base.go -tags=bf16,f16
+
+func init() {
+	// BFloat16 and Float16 need float32 accumulation and output to float32 buffer.
+	// The caller (execDotGeneral) handles conversion back to native dtype.
+	dotGeneralSmallMatMulDTypeMap.Register(dtypes.BFloat16, priorityTyped, execDotGeneralSmallMatMulBFloat16)
+	dotGeneralSmallMatMulDTypeMap.Register(dtypes.Float16, priorityTyped, execDotGeneralSmallMatMulFloat16)
+}
